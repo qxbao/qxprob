@@ -1,5 +1,8 @@
 # @qxbao/qxprob
 
+[![CI](https://github.com/qxbao/qxprob/actions/workflows/ci.yml/badge.svg)](https://github.com/qxbao/qxprob/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/qxbao/qxprob.svg)](https://pkg.go.dev/github.com/qxbao/qxprob)
+
 `qxprob` is a dependency-free Go library for deterministic, provably-fair game outcomes and unbiased probability primitives.
 
 It provides:
