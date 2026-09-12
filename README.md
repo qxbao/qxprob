@@ -1,0 +1,684 @@
+# @qxbao/qxprob
+
+`qxprob` is a dependency-free Go library for deterministic, provably-fair game outcomes and unbiased probability primitives.
+
+It provides:
+
+- cryptographically secure and reproducible entropy sources;
+- configurable Plinko, Mines, Duck Race, Crash, and Limbo engines;
+- one-shot seeded APIs for independently replayable rounds;
+- injected-source APIs for testing and high-throughput simulations;
+- a generic sequential simulation runner.
+
+The module uses only the Go standard library.
+
+> [!IMPORTANT]
+> qxprob generates and evaluates mathematical outcomes. It does not manage wagers, balances, server-seed rotation, commitments, persistence, compliance, or player-facing disclosure.
+
+## Requirements
+
+- Go 1.22 or newer.
+- No third-party runtime dependencies.
+
+Go 1.22 is required because the simulation package ranges over an integer round count.
+
+## Installation
+
+```bash
+go get github.com/qxbao/qxprob
+```
+
+Import only the packages you need:
+
+```go
+import (
+	"github.com/qxbao/qxprob/core/entropy"
+	"github.com/qxbao/qxprob/core/simulation"
+	"github.com/qxbao/qxprob/engine/crash"
+	"github.com/qxbao/qxprob/engine/duckrace"
+	"github.com/qxbao/qxprob/engine/limbo"
+	"github.com/qxbao/qxprob/engine/mines"
+	"github.com/qxbao/qxprob/engine/plinko"
+)
+```
+
+## Packages
+
+| Package | Purpose |
+|---|---|
+| `core/entropy` | Secure randomness, reproducible HMAC-SHA-256 streams, bits, floats, and unbiased bounded integers |
+| `core/simulation` | Generic sequential runner for any engine exposing `Play() (T, error)` |
+| `engine/plinko` | Left/right paths, landing buckets, generated or custom payout tables |
+| `engine/mines` | Unique mine placement, ordered reveals, and cash-out multipliers |
+| `engine/duckrace` | Finish order and per-duck positions over time |
+| `engine/crash` | Crash multiplier with house edge, instant-crash probability, and optional cap |
+| `engine/limbo` | Inverse-distributed multiplier and target-based settlement |
+
+## Quick start
+
+The shortest way to generate a verifiable round is a game's seeded helper:
+
+```go
+package main
+
+import (
+	"fmt"
+	"log"
+
+	"github.com/qxbao/qxprob/engine/plinko"
+)
+
+func main() {
+	result, err := plinko.PlaySeeded(plinko.SeededInput{
+		ServerSeed: "secret-server-seed",
+		ClientSeed: "player-selected-seed",
+		Nonce:      42,
+		Rows:       12,
+		Risk:       plinko.Medium,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Println("path:", result.Path)
+	fmt.Println("bucket:", result.BucketIndex)
+	fmt.Println("multiplier:", result.Multiplier)
+}
+```
+
+Running the same function again with the same seeds, nonce, configuration, and qxprob protocol version returns the same result.
+
+## Provably-fair model
+
+### Round inputs
+
+A reproducible round uses three inputs:
+
+- `ServerSeed`: secret operator-controlled input, revealed only after settlement;
+- `ClientSeed`: player-visible or player-selected input;
+- `Nonce`: unique round number for the current seed pair.
+
+The deterministic stream is:
+
+```text
+HMAC-SHA-256(
+  key     = serverSeed,
+  message = "qxprob/entropy/v1\x00"
+            || uint64_be(len(clientSeed))
+            || clientSeed
+            || uint64_be(nonce)
+            || uint64_be(counter)
+)
+```
+
+Consecutive reads consume bytes from each 32-byte HMAC block. The counter increments when the current block is exhausted.
+
+The domain, integer widths, byte order, field order, counter behavior, and each engine's entropy call order are compatibility-sensitive. Changing any of them changes deterministic results.
+
+### Recommended commitment lifecycle
+
+qxprob provides replayable outcomes, not a complete commitment service. An application should:
+
+1. Generate a high-entropy server seed using a cryptographically secure source.
+2. Publish a cryptographic commitment such as `SHA-256(serverSeed)` before accepting a bet.
+3. Accept or publish the client seed.
+4. Assign a nonce that is never reused with the same seed pair.
+5. Generate and settle the round without exposing the server seed.
+6. Rotate and reveal the server seed after the applicable rounds are settled.
+7. Let players verify the commitment and replay each outcome.
+
+Never log or return an unrevealed server seed.
+
+### One-shot versus injected-source APIs
+
+Every game supports two styles.
+
+Use a seeded helper for a self-contained round:
+
+```go
+result, err := limbo.PlaySeeded(limbo.SeededInput{
+	ServerSeed: "server",
+	ClientSeed: "client",
+	Nonce:      1,
+	Config:     limbo.Config{TargetMultiplier: 3},
+})
+```
+
+Use an injected source when the caller owns the entropy lifecycle or runs multiple rounds:
+
+```go
+source := entropy.NewProvablyFairSource("server", "client", 1)
+engine, err := limbo.New(limbo.Config{TargetMultiplier: 3}, source)
+if err != nil {
+	return
+}
+
+first, err := engine.Play()
+if err != nil {
+	return
+}
+second, err := engine.Play() // consumes the next value from the same stream
+_, _ = first, second
+```
+
+For provably-fair production rounds, construct a new deterministic source per round. Reusing one source across `Play` calls produces a deterministic sequence, but it is not equivalent to incrementing the nonce.
+
+## Entropy sources
+
+All engines depend on the following interface:
+
+```go
+type Source interface {
+	Float64() (float64, error)
+	Bits(n int) (uint64, error)
+	Uint64() (uint64, error)
+	Intn(n uint64) (uint64, error)
+}
+```
+
+### `CryptoSource`
+
+`entropy.NewCryptoSource()` reads from `crypto/rand` and is safe for concurrent use.
+
+```go
+source := entropy.NewCryptoSource()
+
+u, err := source.Float64() // one of 2^53 values in [0, 1)
+n, err := source.Intn(100) // unbiased value in [0, 100)
+bits, err := source.Bits(12)
+word, err := source.Uint64()
+
+_, _, _, _ = u, n, bits, word
+_ = err
+```
+
+`Intn` uses rejection sampling rather than a raw modulus, avoiding modulo bias.
+
+### `ProvablyFairSource`
+
+`entropy.NewProvablyFairSource(serverSeed, clientSeed, nonce)` returns a stateful reproducible stream.
+
+```go
+a := entropy.NewProvablyFairSource("server", "client", 7)
+b := entropy.NewProvablyFairSource("server", "client", 7)
+
+av, _ := a.Uint64()
+bv, _ := b.Uint64()
+fmt.Println(av == bv) // true
+```
+
+Important properties:
+
+- one instance should belong to one round or one sequential simulation;
+- it is not safe for concurrent use;
+- method order matters;
+- `Bits` consumes whole bytes even for non-byte-aligned widths;
+- the low-level constructor accepts empty seeds, so application policy must validate them;
+- game-level seeded helpers reject empty server and client seeds.
+
+## Plinko
+
+Plinko generates one unbiased Left/Right decision per row. The number of right decisions is the landing bucket.
+
+```go
+result, err := plinko.PlaySeeded(plinko.SeededInput{
+	ServerSeed: "server",
+	ClientSeed: "client",
+	Nonce:      10,
+	Rows:       16,
+	Risk:       plinko.High,
+	TargetRTP:  0.97,
+})
+```
+
+### Configuration
+
+| Field | Valid values | Zero value |
+|---|---:|---|
+| `Rows` | 8–16 | Invalid; required |
+| `Risk` | `Low`, `Medium`, `High` | `Low` |
+| `TargetRTP` | `(0, 1]` | `0.99` |
+| `RiskAlpha` | positive finite value | Selected risk default |
+| `Multipliers` | `Rows+1` finite non-negative values | Generate from formula |
+
+Default risk exponents are Low `0.30`, Medium `0.60`, and High `0.90`.
+
+Without a custom table, bucket `k` uses:
+
+```text
+p(k) = C(rows, k) / 2^rows
+w(k) = p(k)^(-alpha)
+Z    = sum(p(j) * w(j))
+multiplier(k) = TargetRTP * w(k) / Z
+```
+
+This creates symmetric payouts whose expected multiplier equals the configured RTP before external currency rounding.
+
+Provide `Multipliers` to replace the generated table:
+
+```go
+custom := []float64{10, 4, 2, 1, 0, 1, 2, 4, 10}
+
+engine, err := plinko.New(plinko.Config{
+	Rows:        8,
+	Risk:        plinko.Low,
+	Multipliers: custom,
+}, entropy.NewCryptoSource())
+```
+
+The engine copies the table during construction, so later caller mutations do not change payouts.
+
+### Result
+
+```go
+type Result struct {
+	Path        []Direction
+	BucketIndex int
+	Multiplier  float64
+}
+```
+
+Entropy consumption: exactly `Rows` calls to `Intn(2)`.
+
+## Mines
+
+Mines generates unique mine locations using a partial Fisher-Yates shuffle. Mine indices are sorted in the returned board for canonical replay output.
+
+```go
+board, err := mines.GenerateSeeded(mines.SeededInput{
+	ServerSeed: "server",
+	ClientSeed: "client",
+	Nonce:      11,
+	BoardSize:  25,
+	MineCount:  5,
+	TargetRTP:  0.99,
+})
+if err != nil {
+	log.Fatal(err)
+}
+
+evaluation, err := board.Evaluate([]int{0, 6, 12})
+if err != nil {
+	log.Fatal(err)
+}
+
+fmt.Println(evaluation.Lost)
+fmt.Println(evaluation.SafePicks)
+fmt.Println(evaluation.Multiplier)
+```
+
+> [!WARNING]
+> `Board.MineIndices` contains the complete secret layout. Keep the board server-side during play. Return only the relevant reveal information to a client, and disclose the full board only during the verification phase.
+
+### Configuration
+
+| Field | Valid values | Zero value |
+|---|---:|---|
+| `BoardSize` | 2–1024 | 25 |
+| `MineCount` | 1–`BoardSize-1` | Invalid; required |
+| `TargetRTP` | `(0, 1]` | `0.99` |
+
+After `s` safe picks, the cash-out multiplier is:
+
+```text
+survival = C(BoardSize - MineCount, s) / C(BoardSize, s)
+multiplier = TargetRTP / survival
+```
+
+An empty pick sequence returns `1.0`. Hitting a mine returns a zero multiplier and stops evaluation. Picks are fully validated before evaluation; duplicate and out-of-range picks return errors.
+
+### Results
+
+```go
+type Board struct {
+	TileCount  int
+	TargetRTP  float64
+	MineIndices []int
+}
+
+type Evaluation struct {
+	Reveals    []Reveal
+	Lost       bool
+	SafePicks  int
+	Multiplier float64
+}
+```
+
+Entropy consumption: exactly `MineCount` calls to `Intn`, with bounds decreasing from `BoardSize`.
+
+## Duck Race
+
+Duck Race returns both an unbiased finish order and a complete monotonic position timeline suitable for UI playback.
+
+```go
+race, err := duckrace.RaceSeeded(duckrace.SeededInput{
+	ServerSeed: "server",
+	ClientSeed: "client",
+	Nonce:      12,
+	Config: duckrace.Config{
+		DuckCount:      8,
+		DurationMillis: 10_000,
+		TickMillis:     100,
+	},
+})
+if err != nil {
+	log.Fatal(err)
+}
+
+winner := race.FinishOrder[0]
+for _, frame := range race.Frames {
+	updateUI(frame.ElapsedMillis, frame.Positions)
+}
+fmt.Println("winner:", winner)
+```
+
+### Configuration
+
+| Field | Valid values | Zero value |
+|---|---:|---|
+| `DuckCount` | 2–16 | Invalid; required |
+| `DurationMillis` | 1,000–60,000 | Invalid; required |
+| `TickMillis` | 50–1,000 and divides duration exactly | Invalid; required |
+| `BaseSegmentWeight` | positive finite value | `0.25` |
+| `FinishProgress` | `(0, 1]` | `1.0` |
+| `RankGap` | positive and keeps last place above zero | `0.01` |
+
+The finish order is selected first with Fisher-Yates. Each duck then receives positive per-segment weights:
+
+```text
+weight = BaseSegmentWeight + Float64()
+final position(rank) = FinishProgress - RankGap * rank
+```
+
+Weights are normalized to the duck's final position. Consequently:
+
+- positions never decrease;
+- all positions remain normalized to `[0,1]`;
+- intermediate lead changes are possible;
+- the last frame strictly represents `FinishOrder`;
+- frame position slices are independent and safe for the caller to mutate.
+
+Entropy consumption for `D` ducks and `S = DurationMillis/TickMillis` segments:
+
+```text
+(D - 1) Intn calls, followed by D * S Float64 calls
+```
+
+Output memory is `O(D*S)`. A coarser tick reduces entropy work, allocations, payload size, and UI update frequency.
+
+## Crash
+
+Crash converts one uniform float into an inverse-distributed multiplier, with an optional instant-crash region.
+
+```go
+result, err := crash.PlaySeeded(crash.SeededInput{
+	ServerSeed: "server",
+	ClientSeed: "client",
+	Nonce:      13,
+	Config: crash.Config{
+		HouseEdge:               1.0,
+		InstantCrashProbability: 1.0 / 33.0,
+		MaxMultiplier:           1_000_000,
+	},
+})
+```
+
+### Configuration
+
+| Field | Valid values | Zero value |
+|---|---:|---|
+| `HouseEdge` | percentage in `[0,100)` | 0% |
+| `InstantCrashProbability` | `[0,1]` | Disabled |
+| `MaxMultiplier` | zero or finite `>= 1` | Uncapped |
+
+For sampled `u`:
+
+```text
+if u < InstantCrashProbability:
+    multiplier = 1.0
+    instantCrash = true
+else:
+    multiplier = max((100 - HouseEdge) / (100 * (1 - u)), 1.0)
+    multiplier = min(multiplier, MaxMultiplier) // when configured
+```
+
+Entropy consumption: exactly one `Float64` call.
+
+## Limbo
+
+Limbo generates an inverse-distributed outcome and settles it against a player-selected target.
+
+```go
+result, err := limbo.PlaySeeded(limbo.SeededInput{
+	ServerSeed: "server",
+	ClientSeed: "client",
+	Nonce:      14,
+	Config: limbo.Config{
+		RTP:              0.99,
+		MinMultiplier:    1,
+		MaxMultiplier:    1_000_000,
+		PayoutStep:       0.01,
+		TargetMultiplier: 5,
+	},
+})
+
+fmt.Println(result.Multiplier)
+fmt.Println(result.Won)
+fmt.Println(result.PayoutMultiplier)
+```
+
+### Configuration
+
+| Field | Valid values | Zero value |
+|---|---:|---|
+| `RTP` | `(0,1]` | `0.99` |
+| `MinMultiplier` | finite `>= 1` | `1.0` |
+| `MaxMultiplier` | finite and `>= MinMultiplier` | `1,000,000` |
+| `PayoutStep` | `(0, MinMultiplier]` | `0.01` |
+| `TargetMultiplier` | `[MinMultiplier, MaxMultiplier]` | `2.0` |
+
+For sampled `u`:
+
+```text
+if u == 0:
+    multiplier = MaxMultiplier
+else:
+    raw = RTP / u
+    multiplier = floor(raw / PayoutStep) * PayoutStep
+    multiplier = clamp(multiplier, MinMultiplier, MaxMultiplier)
+
+won = multiplier >= TargetMultiplier
+payoutMultiplier = TargetMultiplier if won, otherwise 0
+```
+
+Rounding occurs before clamping. A target exactly equal to the outcome wins.
+
+Entropy consumption: exactly one `Float64` call.
+
+## Simulation
+
+Every game engine implements `simulation.Engine[T]`:
+
+```go
+type Engine[T any] interface {
+	Play() (T, error)
+}
+```
+
+Use `simulation.Run` to execute sequential rounds without storing every result:
+
+```go
+ctx := context.Background()
+source := entropy.NewCryptoSource()
+
+engine, err := crash.New(crash.Config{
+	HouseEdge:     1,
+	MaxMultiplier: 1_000,
+}, source)
+if err != nil {
+	log.Fatal(err)
+}
+
+err = simulation.Run(ctx, engine, 1_000_000, func(round uint64, result crash.Result) error {
+	consume(round, result)
+	return nil
+})
+if err != nil {
+	log.Fatal(err)
+}
+```
+
+The runner:
+
+- validates the context, engine, and observer;
+- executes rounds sequentially;
+- checks cancellation before every round;
+- streams each result to the observer;
+- wraps engine, observer, and context errors with the round index.
+
+It does not start goroutines or retain results.
+
+## Validation and errors
+
+Constructors validate configuration before consuming entropy. Game packages expose sentinel errors for invalid inputs, so callers can use `errors.Is`:
+
+```go
+engine, err := plinko.New(
+	plinko.Config{Rows: 7, Risk: plinko.Low},
+	entropy.NewCryptoSource(),
+)
+if errors.Is(err, plinko.ErrInvalidRows) {
+	// Return a validation response to the caller.
+}
+_ = engine
+```
+
+Entropy dependency errors are wrapped with `%w` and remain discoverable:
+
+```go
+if errors.Is(err, storageOrDeviceError) {
+	// Handle the underlying failure.
+}
+```
+
+The entropy package exposes `ErrInvalidBitCount`, `ErrInvalidBound`, and `ErrEntropyExhausted`, so callers can inspect validation and stream-exhaustion failures with `errors.Is`.
+
+## Determinism and compatibility
+
+The following behavior is part of deterministic replay:
+
+| Component | Replay-sensitive behavior |
+|---|---|
+| Entropy | HMAC domain, seed encoding, nonce/counter widths, byte order, cursor behavior |
+| Plinko | `Rows` ordered calls to `Intn(2)` and payout configuration |
+| Mines | Partial-shuffle order, decreasing bounds, sorted output, board size and RTP |
+| Duck Race | Finish shuffle first, then floats ordered by duck and segment, timeline configuration |
+| Crash | One float, formula, instant-crash comparison, floor, and cap |
+| Limbo | One float, inverse formula, payout step, clamp order, and target comparison |
+
+To reproduce an outcome, retain:
+
+- qxprob module version;
+- server seed and its prior commitment;
+- client seed;
+- nonce;
+- complete game configuration;
+- result or result hash for comparison.
+
+Do not change deterministic-vector expectations merely to make a test pass. A deliberate protocol change should use an explicit new version and retain old verification support where required.
+
+## Concurrency
+
+- `CryptoSource` is safe for concurrent use.
+- `ProvablyFairSource` is stateful and not safe for concurrent use.
+- Engines hold their source and do not synchronize access.
+- Use one engine/source per goroutine for deterministic rounds.
+- `simulation.Run` is deliberately sequential.
+- Returned Plinko paths and Duck Race frame slices are newly allocated for each result.
+
+## Security considerations
+
+- Generate production server seeds with a CSPRNG.
+- Never use `math/rand` for game outcomes.
+- Never reuse a nonce with the same server/client seed pair.
+- Commit to the server seed before accepting play and reveal it only after settlement.
+- Do not send `mines.Board.MineIndices` to an active player.
+- Keep money calculations and wallet state outside this floating-point probability layer.
+- Decide currency rounding and payout limits explicitly at the settlement boundary.
+- Treat configuration and engine version as part of the signed/audited round record.
+- Run supported Go toolchains in production even though the module's compatibility floor is Go 1.22.
+
+Provably fair means an outcome can be replayed and verified from committed inputs. It does not by itself prove correct application code, secure seed custody, regulatory compliance, or solvent settlement.
+
+## Performance notes
+
+- Injected engines avoid recreating a source and are useful for simulations.
+- Seeded helpers intentionally create one HMAC stream per round.
+- Plinko precomputes its payout table during construction.
+- Mines allocates storage proportional to board size.
+- Duck Race work and output scale with duck count multiplied by frame count.
+- Crash and Limbo consume one float per round.
+- Benchmark your actual configuration before choosing UI tick rates or simulation batch sizes.
+
+Run package benchmarks with:
+
+```bash
+go test -bench=. -benchmem ./engine/...
+```
+
+## Development
+
+```bash
+gofmt -w core engine
+go test ./...
+go test -race ./...
+go vet ./...
+```
+
+Test the declared compatibility floor with an actual Go 1.22 toolchain, not only a newer compiler using the `go 1.22` language mode.
+
+## Project layout
+
+```text
+qxprob/
+├── core/
+│   ├── entropy/       # secure and reproducible random sources
+│   └── simulation/    # generic sequential runner
+├── engine/
+│   ├── crash/
+│   ├── duckrace/
+│   ├── limbo/
+│   ├── mines/
+│   └── plinko/
+└── docs/spec/         # implementation contracts and design decisions
+```
+
+## FAQ
+
+### Does qxprob publish or verify server-seed commitments?
+
+No. It provides deterministic entropy and game replay. Commitment publication, rotation, storage, and disclosure belong to the application.
+
+### Are seeded helpers compatible with another casino's verifier?
+
+Not necessarily. qxprob uses its own versioned HMAC message format and game conversion rules. Verify qxprob rounds with the same qxprob protocol version.
+
+### Can one deterministic source be shared by multiple goroutines?
+
+No. Construct one `ProvablyFairSource` per round and keep it owned by one goroutine.
+
+### Why do optional configuration fields use zero as a default?
+
+This keeps existing composite literals source-compatible as configuration grows. It also means zero cannot always express a literal policy value; consult each configuration table.
+
+### Why are monetary amounts not included?
+
+The library operates on probabilities and multipliers. Currency precision, rounding, limits, accounting, and settlement policies vary by application and should use an appropriate fixed-point or decimal representation outside qxprob.
+
+### Is a Mines board safe to return to a browser?
+
+Only after the round is settled or when intentionally revealing it for verification. During active play, expose individual reveal results rather than the complete mine layout.
+
+## License
+
+qxprob is released under the [MIT License](LICENSE).

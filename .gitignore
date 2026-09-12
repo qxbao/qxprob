@@ -1,0 +1,10 @@
+graphify-out/
+docs/
+.graphifyignore
+.*/
+!.github/
+!.github/**
+*.jsonl
+*.json
+*.md
+!README.md
