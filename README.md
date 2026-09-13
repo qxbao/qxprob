@@ -9,9 +9,10 @@ It provides:
 
 - cryptographically secure and reproducible entropy sources;
 - configurable Plinko, Mines, Duck Race, Crash, and Limbo engines;
+- a modular, config-driven Slot Engine with ways wins, cascades, free spins, semantic events, and fixed-point settlement;
 - one-shot seeded APIs for independently replayable rounds;
 - injected-source APIs for testing and high-throughput simulations;
-- a generic sequential simulation runner.
+- generic and slot-specific Monte Carlo simulation tooling.
 
 The module uses only the Go standard library.
 
@@ -37,11 +38,15 @@ Import only the packages you need:
 import (
 	"github.com/qxbao/qxprob/core/entropy"
 	"github.com/qxbao/qxprob/core/simulation"
+	coreslot "github.com/qxbao/qxprob/core/slot"
 	"github.com/qxbao/qxprob/engine/crash"
 	"github.com/qxbao/qxprob/engine/duckrace"
 	"github.com/qxbao/qxprob/engine/limbo"
 	"github.com/qxbao/qxprob/engine/mines"
 	"github.com/qxbao/qxprob/engine/plinko"
+	engineslot "github.com/qxbao/qxprob/engine/slot"
+	"github.com/qxbao/qxprob/engine/slotgame/reference"
+	"github.com/qxbao/qxprob/slotsim"
 )
 ```
 
@@ -51,11 +56,17 @@ import (
 |---|---|
 | `core/entropy` | Secure randomness, reproducible HMAC-SHA-256 streams, bits, floats, and unbiased bounded integers |
 | `core/simulation` | Generic sequential runner for any engine exposing `Play() (T, error)` |
+| `core/slot` | Strongly typed slot definitions, validation, evaluators, money, grids, states, events, and feature contracts |
 | `engine/plinko` | Left/right paths, landing buckets, generated or custom payout tables |
 | `engine/mines` | Unique mine placement, ordered reveals, and cash-out multipliers |
 | `engine/duckrace` | Finish order and per-duck positions over time |
 | `engine/crash` | Crash multiplier with house edge, instant-crash probability, and optional cap |
 | `engine/limbo` | Inverse-distributed multiplier and target-based settlement |
+| `engine/slot` | Server-authoritative slot orchestration and reusable compiled games |
+| `engine/slotfeature` | Configurable wild, scatter, cascade, and free-spin feature modules |
+| `engine/slotgame/reference` | Versioned 5x4 Reference Ways Slot definition and reel strips |
+| `slotsim` | Streaming slot simulation, statistics, and text/JSON/CSV reports |
+| `cmd/slot-sim` | Command-line Monte Carlo runner for versioned slot definitions |
 
 ## Quick start
 
@@ -164,7 +175,7 @@ second, err := engine.Play() // consumes the next value from the same stream
 _, _ = first, second
 ```
 
-For provably-fair production rounds, construct a new deterministic source per round. Reusing one source across `Play` calls produces a deterministic sequence, but it is not equivalent to incrementing the nonce.
+For independent production rounds, constructing one deterministic source per round remains the simplest ownership model. A sequential owner such as the slot simulator may instead call `ResetNonce` before each round. Reusing a source across calls without resetting it consumes the same nonce's continuing byte stream and is not equivalent to incrementing the nonce.
 
 ## Entropy sources
 
@@ -218,6 +229,32 @@ Important properties:
 - `Bits` consumes whole bytes even for non-byte-aligned widths;
 - the low-level constructor accepts empty seeds, so application policy must validate them;
 - game-level seeded helpers reject empty server and client seeds.
+
+For a sequential simulation, resetting a source is byte-for-byte equivalent to constructing a fresh source with the same seeds and new nonce:
+
+```go
+source := entropy.NewProvablyFairSource("server", "client", 1)
+
+source.ResetNonce(42)
+value, err := source.Uint64()
+_ = value
+_ = err
+```
+
+`ResetNonce` resets the counter, buffered block, and cursor. It does not make `ProvablyFairSource` safe for concurrent use.
+
+### `SimulationSource`
+
+`entropy.NewSimulationSource(seed1, seed2)` provides a deterministic PCG source for Monte Carlo experiments:
+
+```go
+source := entropy.NewSimulationSource(1234, 5678)
+value, err := source.Intn(100)
+_, _ = value, err
+```
+
+> [!WARNING]
+> `SimulationSource` uses `math/rand/v2`. It is neither cryptographically secure nor provably fair and must never determine production game outcomes or payouts.
 
 ## Plinko
 
@@ -498,6 +535,70 @@ Rounding occurs before clamping. A target exactly equal to the outcome wins.
 
 Entropy consumption: exactly one `Float64` call.
 
+## Slot Engine
+
+The Slot Engine separates versioned math configuration from entropy, settlement, presentation events, and UI timing. A result is generated and fully evaluated before a frontend consumes its semantic event stream.
+
+The reference game demonstrates:
+
+- five reels by four visible rows and 1,024 ways;
+- left-to-right wins starting at three consecutive reels;
+- configurable regular, wild, and scatter symbols without hard-coded symbol IDs;
+- reel-strip sampling with wrap-around;
+- cascades with a configurable multiplier table;
+- retriggerable free spins using a separate reel set;
+- fixed-point bet and payout accounting;
+- a configurable 10,000x maximum-win policy;
+- normal play with presentation events and an allocation-reduced simulation mode.
+
+### Compile once, spin many rounds
+
+Compile and validate immutable game math once, then inject the round's entropy source into `Game.Spin`:
+
+```go
+def := reference.Definition()
+validated, err := coreslot.ValidateDefinition(def)
+if err != nil {
+	log.Fatal(err)
+}
+
+game, err := engineslot.Compile(
+	def,
+	reference.Features(validated),
+	engineslot.Options{Mode: coreslot.PlayModeSimulation},
+)
+if err != nil {
+	log.Fatal(err)
+}
+
+source := entropy.NewProvablyFairSource("server", "client", 1)
+for nonce := uint64(1); nonce <= 1_000; nonce++ {
+	source.ResetNonce(nonce)
+	result, err := game.Spin(coreslot.SpinRequest{
+		GameID:  reference.GameID,
+		Version: reference.ConfigVersion,
+		Bet:     coreslot.Amount(100), // minor currency units
+		Mode:    coreslot.PlayModeSimulation,
+	}, source)
+	if err != nil {
+		log.Fatal(err)
+	}
+	consume(result)
+}
+```
+
+`Compile` deep-copies and validates the definition, resolves the evaluator, orders registered feature modules, and consumes no entropy. The resulting `Game` retains no nonce, grid, or round state. It may be reused concurrently when each goroutine supplies its own entropy source and custom evaluators/features are themselves concurrency-safe.
+
+The legacy `slot.New(def, source, features, options)` and bound `Engine.Spin` API remains available for compatibility. Prefer `Compile` and `Game.Spin` for servers and high-volume simulations so validation and feature assembly do not repeat for every nonce. `PlaySeeded` remains useful for a self-contained, replayable round.
+
+### Configuration and extension points
+
+`core/slot.Definition` owns the immutable game ID/version, grid shape, symbols, reel sets, win mechanic, cascades, free spins, maximum win, and math profile. Feature behavior is supplied through ordered `Feature` hooks; presentation code receives semantic events and never chooses reel stops, wins, multipliers, or payouts.
+
+The built-in evaluator implements Ways to Win without assuming five reels or fixed symbol names. Alternative evaluator implementations can add paylines, clusters, or other mechanics through dependency injection without coupling math to rendering.
+
+Money uses `core/slot.Amount`, an integer count of minor currency units. Multipliers use the slot package's fixed precision; application code remains responsible for wallets, balance validation, idempotent settlement, and persistence.
+
 ## Simulation
 
 Every game engine implements `simulation.Engine[T]`:
@@ -541,6 +642,41 @@ The runner:
 
 It does not start goroutines or retain results.
 
+### Slot simulation
+
+Use `slotsim.RunWithRunner` to reuse both a compiled game and resettable entropy source while streaming aggregate statistics:
+
+```go
+source := entropy.NewProvablyFairSource("simulation-server", "simulation-client", 1)
+
+report, err := slotsim.RunWithRunner(ctx, slotsim.Options{
+	Spins: 1_000_000,
+	Bet:   coreslot.Amount(100),
+}, func(nonce uint64, req coreslot.SpinRequest) (coreslot.SpinResult, error) {
+	source.ResetNonce(nonce)
+	return game.Spin(req, source)
+})
+if err != nil {
+	log.Fatal(err)
+}
+
+fmt.Printf("RTP: %.4f%%\n", report.TotalRTP*100)
+```
+
+The command-line tool supports deterministic text, JSON, and CSV output:
+
+```bash
+go run ./cmd/slot-sim \
+  --game reference-ways-slot \
+  --version 1.0.0 \
+  --spins 1000000 \
+  --bet 100 \
+  --format json \
+  --output report.json
+```
+
+The reference paytable and reel strips are initial calibration data, not a production-certified math model. Measure RTP, volatility, feature frequency, distribution tails, and maximum wins over a statistically meaningful sample before deployment.
+
 ## Validation and errors
 
 Constructors validate configuration before consuming entropy. Game packages expose sentinel errors for invalid inputs, so callers can use `errors.Is`:
@@ -578,6 +714,8 @@ The following behavior is part of deterministic replay:
 | Duck Race | Finish shuffle first, then floats ordered by duck and segment, timeline configuration |
 | Crash | One float, formula, instant-crash comparison, floor, and cap |
 | Limbo | One float, inverse formula, payout step, clamp order, and target comparison |
+| Slot | Immutable game/config version, reel strips, feature order, evaluator rules, entropy calls, and maximum-win policy |
+| Entropy reset | `ResetNonce(n)` produces the same stream as a fresh source constructed with the same seeds and nonce `n` |
 
 To reproduce an outcome, retain:
 
@@ -596,6 +734,8 @@ Do not change deterministic-vector expectations merely to make a test pass. A de
 - `ProvablyFairSource` is stateful and not safe for concurrent use.
 - Engines hold their source and do not synchronize access.
 - Use one engine/source per goroutine for deterministic rounds.
+- A compiled slot `Game` is reusable; each concurrent caller must provide its own entropy source.
+- Custom slot features and evaluators must be concurrency-safe when shared through a compiled game.
 - `simulation.Run` is deliberately sequential.
 - Returned Plinko paths and Duck Race frame slices are newly allocated for each result.
 
@@ -603,6 +743,7 @@ Do not change deterministic-vector expectations merely to make a test pass. A de
 
 - Generate production server seeds with a CSPRNG.
 - Never use `math/rand` for game outcomes.
+- Never use `SimulationSource` for production outcomes, verification, or settlement.
 - Never reuse a nonce with the same server/client seed pair.
 - Commit to the server seed before accepting play and reveal it only after settlement.
 - Do not send `mines.Board.MineIndices` to an active player.
@@ -621,7 +762,11 @@ Provably fair means an outcome can be replayed and verified from committed input
 - Mines allocates storage proportional to board size.
 - Duck Race work and output scale with duck count multiplied by frame count.
 - Crash and Limbo consume one float per round.
+- Compiled slot games avoid rebuilding and validating the full definition for every spin.
+- `PlayModeSimulation` suppresses presentation event payloads that Monte Carlo runs do not need.
 - Benchmark your actual configuration before choosing UI tick rates or simulation batch sizes.
+
+In a local paired benchmark of the reference slot lifecycle, compile-once spins averaged about `23.18 us/op`, `20.8 KB/op`, and `282 allocs/op`, compared with about `37.55 us/op`, `36.2 KB/op`, and `391 allocs/op` for rebuilding the legacy engine per nonce. These figures describe one machine and configuration, not an API performance guarantee. The PCG-backed `SimulationSource` is optional and did not improve that end-to-end reference workload because different entropy streams can produce different cascade paths.
 
 Run package benchmarks with:
 
@@ -646,13 +791,20 @@ Test the declared compatibility floor with an actual Go 1.22 toolchain, not only
 qxprob/
 ├── core/
 │   ├── entropy/       # secure and reproducible random sources
-│   └── simulation/    # generic sequential runner
+│   ├── simulation/    # generic sequential runner
+│   └── slot/          # slot definitions, evaluators, money, state, and events
 ├── engine/
 │   ├── crash/
 │   ├── duckrace/
 │   ├── limbo/
 │   ├── mines/
-│   └── plinko/
+│   ├── plinko/
+│   ├── slot/          # reusable compiled slot lifecycle
+│   ├── slotfeature/   # built-in feature modules
+│   └── slotgame/
+│       └── reference/ # Reference Ways Slot configuration
+├── slotsim/           # slot Monte Carlo statistics and exporters
+├── cmd/slot-sim/      # simulation CLI
 └── docs/spec/         # implementation contracts and design decisions
 ```
 
@@ -669,6 +821,10 @@ Not necessarily. qxprob uses its own versioned HMAC message format and game conv
 ### Can one deterministic source be shared by multiple goroutines?
 
 No. Construct one `ProvablyFairSource` per round and keep it owned by one goroutine.
+
+### Can a deterministic source be reused across slot simulation rounds?
+
+Yes, when exactly one sequential owner calls `ResetNonce` before every round. This produces the same bytes as constructing a fresh source for that nonce while avoiding per-round source setup. Do not reset or read the same source concurrently.
 
 ### Why do optional configuration fields use zero as a default?
 
