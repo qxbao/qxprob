@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 )
 
@@ -102,9 +103,12 @@ func (c *CryptoSource) Intn(n uint64) (uint64, error) {
 type ProvablyFairSource struct {
 	serverSeed []byte
 	clientSeed []byte
+	prefix     []byte
+	hash       hash.Hash
 	nonce      uint64
 	counter    uint64
 	block      [hmacBlockSize]byte
+	fields     [16]byte
 	offset     int
 	exhausted  bool
 }
@@ -113,12 +117,33 @@ type ProvablyFairSource struct {
 // HMAC-SHA-256(serverSeed, "qxprob/entropy/v1" || 0x00 || len(clientSeed) ||
 // clientSeed || nonce || counter), where integer fields are unsigned big-endian.
 func NewProvablyFairSource(serverSeed, clientSeed string, nonce uint64) *ProvablyFairSource {
+	sBytes := []byte(serverSeed)
+	cBytes := []byte(clientSeed)
+	prefix := make([]byte, len(hmacDomain)+8+len(cBytes))
+	copy(prefix, hmacDomain)
+	binary.BigEndian.PutUint64(prefix[len(hmacDomain):], uint64(len(cBytes)))
+	copy(prefix[len(hmacDomain)+8:], cBytes)
+
 	return &ProvablyFairSource{
-		serverSeed: []byte(serverSeed),
-		clientSeed: []byte(clientSeed),
+		serverSeed: sBytes,
+		clientSeed: cBytes,
+		prefix:     prefix,
+		hash:       hmac.New(sha256.New, sBytes),
 		nonce:      nonce,
 		offset:     hmacBlockSize,
 	}
+}
+
+// ResetNonce resets the stream position, counter, and exhaustion state for a new round
+// with the given nonce, while retaining the existing seed material and HMAC keying.
+// After ResetNonce, the stream produces bytes identical to NewProvablyFairSource with the same nonce.
+// It is not safe for concurrent use.
+func (p *ProvablyFairSource) ResetNonce(nonce uint64) {
+	p.nonce = nonce
+	p.counter = 0
+	p.offset = hmacBlockSize
+	p.exhausted = false
+	clear(p.block[:])
 }
 
 // Float64 returns one of 2^53 equally likely values in [0, 1).
@@ -183,17 +208,22 @@ func (p *ProvablyFairSource) refill() error {
 		return ErrEntropyExhausted
 	}
 
-	hash := hmac.New(sha256.New, p.serverSeed)
-	hash.Write([]byte(hmacDomain))
-	var length [8]byte
-	binary.BigEndian.PutUint64(length[:], uint64(len(p.clientSeed)))
-	hash.Write(length[:])
-	hash.Write(p.clientSeed)
-	var fields [16]byte
-	binary.BigEndian.PutUint64(fields[:8], p.nonce)
-	binary.BigEndian.PutUint64(fields[8:], p.counter)
-	hash.Write(fields[:])
-	copy(p.block[:], hash.Sum(nil))
+	if p.hash == nil {
+		p.hash = hmac.New(sha256.New, p.serverSeed)
+	}
+	if p.prefix == nil {
+		p.prefix = make([]byte, len(hmacDomain)+8+len(p.clientSeed))
+		copy(p.prefix, hmacDomain)
+		binary.BigEndian.PutUint64(p.prefix[len(hmacDomain):], uint64(len(p.clientSeed)))
+		copy(p.prefix[len(hmacDomain)+8:], p.clientSeed)
+	}
+
+	p.hash.Reset()
+	p.hash.Write(p.prefix)
+	binary.BigEndian.PutUint64(p.fields[:8], p.nonce)
+	binary.BigEndian.PutUint64(p.fields[8:], p.counter)
+	p.hash.Write(p.fields[:])
+	p.hash.Sum(p.block[:0])
 	p.offset = 0
 	if p.counter == ^uint64(0) {
 		p.exhausted = true

@@ -309,3 +309,257 @@ func (s *testUint64Source) Uint64() (uint64, error) {
 	s.index++
 	return value, nil
 }
+
+// TestProvablyFairResetNonceEquivalence verifies that ResetNonce produces streams
+// byte-for-byte identical to fresh instances across all public sampling methods and the HMAC oracle.
+func TestProvablyFairResetNonceEquivalence(t *testing.T) {
+	const serverSeed = "reusable-server-seed"
+	const clientSeed = "reusable-client-seed"
+
+	reused := NewProvablyFairSource(serverSeed, clientSeed, 0)
+
+	testNonces := []uint64{1, 2, 42, 100, 1000, 99999, ^uint64(0) - 50}
+
+	for _, nonce := range testNonces {
+		// Advance reused source with some random calls to leave dirty state
+		_, _ = reused.Uint64()
+		_, _ = reused.Bits(17)
+
+		// Reset to target nonce
+		reused.ResetNonce(nonce)
+		fresh := NewProvablyFairSource(serverSeed, clientSeed, nonce)
+
+		// 1. Verify against independent HMAC oracle
+		reusedU64, err := reused.Uint64()
+		if err != nil {
+			t.Fatalf("nonce %d reused Uint64: %v", nonce, err)
+		}
+		freshU64, err := fresh.Uint64()
+		if err != nil {
+			t.Fatalf("nonce %d fresh Uint64: %v", nonce, err)
+		}
+		oracleBlock := testHMACBlock(serverSeed, clientSeed, nonce, 0)
+		expectedOracleU64 := binary.BigEndian.Uint64(oracleBlock[:8])
+		if reusedU64 != freshU64 || reusedU64 != expectedOracleU64 {
+			t.Fatalf("nonce %d: reused=%x fresh=%x oracle=%x", nonce, reusedU64, freshU64, expectedOracleU64)
+		}
+
+		// 2. Verify Uint64 sequence
+		for i := 0; i < 8; i++ {
+			rVal, err := reused.Uint64()
+			if err != nil {
+				t.Fatal(err)
+			}
+			fVal, err := fresh.Uint64()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if rVal != fVal {
+				t.Fatalf("nonce %d Uint64[%d]: reused %d != fresh %d", nonce, i, rVal, fVal)
+			}
+		}
+
+		// 3. Verify Bits sequence with varying bit widths
+		bitWidths := []int{1, 5, 8, 16, 31, 32, 53, 64}
+		for _, w := range bitWidths {
+			rVal, err := reused.Bits(w)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fVal, err := fresh.Bits(w)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if rVal != fVal {
+				t.Fatalf("nonce %d Bits(%d): reused %d != fresh %d", nonce, w, rVal, fVal)
+			}
+		}
+
+		// 4. Verify Float64 sequence
+		for i := 0; i < 5; i++ {
+			rVal, err := reused.Float64()
+			if err != nil {
+				t.Fatal(err)
+			}
+			fVal, err := fresh.Float64()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if rVal != fVal {
+				t.Fatalf("nonce %d Float64[%d]: reused %f != fresh %f", nonce, i, rVal, fVal)
+			}
+		}
+
+		// 5. Verify Intn sequence
+		bounds := []uint64{2, 6, 10, 37, 100, 10000}
+		for _, b := range bounds {
+			rVal, err := reused.Intn(b)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fVal, err := fresh.Intn(b)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if rVal != fVal {
+				t.Fatalf("nonce %d Intn(%d): reused %d != fresh %d", nonce, b, rVal, fVal)
+			}
+		}
+	}
+}
+
+// TestProvablyFairResetNonceAfterPartialReadsAndBoundaries verifies that resetting
+// after partial-block consumption and cross-block reads properly discards previous position.
+func TestProvablyFairResetNonceAfterPartialReadsAndBoundaries(t *testing.T) {
+	const serverSeed = "partial-server"
+	const clientSeed = "partial-client"
+
+	source := NewProvablyFairSource(serverSeed, clientSeed, 1)
+
+	// Partial read (consume 7 bits = 1 byte read, offset = 1)
+	if _, err := source.Bits(7); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reset to nonce 2
+	source.ResetNonce(2)
+	fresh := NewProvablyFairSource(serverSeed, clientSeed, 2)
+
+	rBytes := make([]byte, 8)
+	fBytes := make([]byte, 8)
+	rVal, err := source.Uint64()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fVal, err := fresh.Uint64()
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary.BigEndian.PutUint64(rBytes, rVal)
+	binary.BigEndian.PutUint64(fBytes, fVal)
+	if !bytesEqual(rBytes, fBytes) {
+		t.Fatalf("after partial read: reused %x != fresh %x", rBytes, fBytes)
+	}
+
+	// Cross-block boundary read (consume 35 bytes -> crosses into block 1)
+	for i := 0; i < 35; i++ {
+		if _, err := source.Bits(8); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Reset to nonce 3
+	source.ResetNonce(3)
+	fresh3 := NewProvablyFairSource(serverSeed, clientSeed, 3)
+	rVal3, err := source.Uint64()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fVal3, err := fresh3.Uint64()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rVal3 != fVal3 {
+		t.Fatalf("after cross-block: reused %x != fresh %x", rVal3, fVal3)
+	}
+}
+
+// TestProvablyFairResetNonceAfterExhaustion verifies that ResetNonce recovers from
+// exhausted state and restores full counter capacity.
+func TestProvablyFairResetNonceAfterExhaustion(t *testing.T) {
+	source := NewProvablyFairSource("server", "client", 1)
+	source.counter = ^uint64(0)
+	if err := source.refill(); err != nil {
+		t.Fatalf("refill failed: %v", err)
+	}
+	source.offset = hmacBlockSize
+
+	// Must return exhausted error
+	if _, err := source.Uint64(); !errors.Is(err, ErrEntropyExhausted) {
+		t.Fatalf("expected ErrEntropyExhausted, got %v", err)
+	}
+
+	// ResetNonce must clear exhausted and reset counter
+	source.ResetNonce(10)
+	fresh := NewProvablyFairSource("server", "client", 10)
+
+	got, err := source.Uint64()
+	if err != nil {
+		t.Fatalf("unexpected error after ResetNonce: %v", err)
+	}
+	want, err := fresh.Uint64()
+	if err != nil {
+		t.Fatalf("fresh error: %v", err)
+	}
+	if got != want {
+		t.Fatalf("got %x, want %x", got, want)
+	}
+}
+
+// TestProvablyFairResetNonceSeedIsolation verifies that independent sources do not leak state.
+func TestProvablyFairResetNonceSeedIsolation(t *testing.T) {
+	sourceA := NewProvablyFairSource("server-A", "client-A", 1)
+	sourceB := NewProvablyFairSource("server-B", "client-B", 1)
+
+	valA, err := sourceA.Uint64()
+	if err != nil {
+		t.Fatal(err)
+	}
+	valB, err := sourceB.Uint64()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if valA == valB {
+		t.Fatalf("distinct seeds produced identical Uint64: %x", valA)
+	}
+
+	sourceA.ResetNonce(2)
+	sourceB.ResetNonce(2)
+
+	valA2, err := sourceA.Uint64()
+	if err != nil {
+		t.Fatal(err)
+	}
+	valB2, err := sourceB.Uint64()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if valA2 == valB2 {
+		t.Fatalf("distinct seeds produced identical Uint64 after ResetNonce: %x", valA2)
+	}
+}
+
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func BenchmarkProvablyFairSource_Intn(b *testing.B) {
+	src := NewProvablyFairSource("benchmark-server-seed", "benchmark-client-seed", 1)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := src.Intn(100); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkProvablyFairSource_ResetNonce(b *testing.B) {
+	src := NewProvablyFairSource("benchmark-server-seed", "benchmark-client-seed", 1)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		src.ResetNonce(uint64(i))
+		if _, err := src.Uint64(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
